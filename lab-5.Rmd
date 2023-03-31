@@ -1,0 +1,610 @@
+---
+title: "Lab 5"
+author: "Elke Windschitl & Lewis White"
+date: "2023-02-08"
+output: html_document
+---
+
+This week's lab is a musical lab. You'll be requesting data from the Spotify API and using it to build k-nearest neighbor and decision tree models.
+
+In order to use the Spotify you must have a Spotify account. If you don't have one, sign up for a free one here: <https://www.spotify.com/us/signup>
+
+Once you have an account, go to Spotify for developers (<https://developer.spotify.com/>) and log in. Click the green "Create a Client ID" button to fill out the form to create an app create an app so you can access the API.
+
+On your developer dashboard page, click on the new app you just created. On the app's dashboard page you will find your Client ID just under the header name of your app. Click "Show Client Secret" to access your secondary Client ID. When you do this you'll be issued a Spotify client ID and client secret key.
+
+**Classify by users**. Build models that predict whether a given song will be in your collection vs. a partner in class. This requires that you were already a Spotify user so you have enough data to work with. You will download your data from the Spotify API and then exchange with another member of class.
+
+```{r}
+# Load libraries
+library(spotifyr) #API interaction
+library(tidyverse)
+library(tidymodels)
+library(rsample)   
+library(recipes)
+library(skimr)
+library(kknn)
+library(hrbrthemes)
+library(viridis)
+library(workflows)
+library(baguette)
+```
+
+Client ID and Client Secret are required to create and access token that is required to interact with the API. You can set them as system values so we don't have to do provide them each time.
+
+```{r}
+access_token <- get_spotify_access_token() #takes ID and SECRET, sends to Spotify and receives an access token
+```
+
+> *This may result in an error:*
+>
+> INVALID_CLIENT: Invalid redirect URI
+>
+> *This can be resolved by editing the callback settings on your app. Go to your app and click "Edit Settings". Under redirect URLs paste this: <http://localhost:1410/> and click save at the bottom.*
+
+## **Data Preparation**
+
+You can use get_my_saved_tracks() to request all your liked tracks. It would be good if you had at least 150-200 liked tracks so the model has enough data to work with. If you don't have enough liked tracks, you can instead use get_my_recently_played(), and in that case grab at least 500 recently played tracks if you can.
+
+The Spotify API returns a dataframe of tracks and associated attributes. However, it will only return up to 50 (or 20) tracks at a time, so you will have to make multiple requests. Use a function to combine all your requests in one call.
+
+```{r}
+# Get first 50 songs
+my_songs <- get_my_saved_tracks(limit = 50)
+
+# for each set of 50 songs, bind to my_songs
+for(i in seq(50, 450, 50)) {
+  songs <- get_my_saved_tracks(limit = 50, offset(i))
+  my_songs <- rbind(my_songs, songs)
+}
+
+#selecting the track id and track name from liked tracks so I can use left_join and only add the track name to the audio features data set
+my_songs_for_joining <- my_songs %>%
+  select(track.id, track.name, track.artists) %>%
+  mutate(primary_artist = unlist(lapply(my_songs$track.artists, 
+                                        function(x) x$name[1]))) %>%
+  select(-track.artists)
+```
+
+Once you have your tracks, familiarize yourself with this initial dataframe. You'll need to request some additional information for the analysis. If you give the API a list of track IDs using get_track_audio_features(), it will return an audio features dataframe of all the tracks and some attributes of them.
+
+```{r}
+# Initiate empty song features vector
+song_features <- c()
+
+# Retreive the song features on track.id for all songs
+for(i in seq(1, 401, 100)) {
+  feats <- get_track_audio_features(my_songs$track.id[seq(i, (i + 99), 1)])
+  song_features <- rbind(song_features, feats)
+}
+
+# Bind song names to track features
+song_features <- cbind(song_features, my_songs_for_joining) %>% 
+  select(-track.id)
+
+#write_csv(song_features, "elke_liked_tracks.csv")
+```
+
+These track audio features are the predictors we are interested in, but this dataframe doesn't have the actual names of the tracks. Append the 'track.name' column from your favorite tracks database.
+
+Find a class mate whose data you would like to use. Add your partner's data to your dataset. Create a new column that will contain the outcome variable that you will try to predict. This variable should contain two values that represent if the track came from your data set or your partner's.
+
+```{r}
+lewis_liked_tracks <- read_csv("lewis_liked_tracks.csv") %>% 
+  mutate(listener = "Lewis")
+elke_liked_tracks <- song_features %>% 
+  mutate(listener = "Elke")
+
+all_tracks <- rbind(lewis_liked_tracks, elke_liked_tracks) %>% 
+  select(-(type:analysis_url)) #remove unnecessary columns
+```
+
+## Data Exploration
+
+Let's take a look at your data. Do some exploratory summary stats and visualization.
+
+For example: What are the most danceable tracks in your dataset? What are some differences in the data between users?
+
+**From the brief (and non-exhaustive) exploration below, we can see that Lewis on average listens to songs that are more danceable, energetic, and speechy than me. I tend to listen to songs that are more acoustic than Lewis. Also, I listen to slightly longer songs than Lewis. There is not a significant difference (at a significance level of 0.05) between the instrumentalness of the songs that Lewis and I listen to.**
+
+```{r}
+# Sort and find my top 5 artists
+sorted_table_e <- sort(table(elke_liked_tracks$primary_artist), decreasing = TRUE)
+top_five_artists_e <- sorted_table_e[1:5]
+print(top_five_artists_e)
+
+# Sort and find lewis's top 5 artists
+sorted_table_l <- sort(table(lewis_liked_tracks$primary_artist), decreasing = TRUE)
+top_five_artists_l <- sorted_table_l[1:5]
+print(top_five_artists_l)
+```
+
+```{r}
+# Find my most danceable songs
+dancable <- elke_liked_tracks %>%
+  arrange(desc(danceability)) %>% 
+  slice(1:5)
+print(dancable[,c("track.name", "danceability")])
+
+# Find my most acoustic songs
+acoustic <- elke_liked_tracks %>%
+  arrange(desc(acousticness)) %>% 
+  slice(1:5)
+print(acoustic[,c("track.name", "acousticness")])
+
+# Find my highest energy songs
+energy <- elke_liked_tracks %>%
+  arrange(desc(energy)) %>% 
+  slice(1:5)
+print(energy[,c("track.name", "energy")])
+
+# Find my speechiest songs
+speechy <- elke_liked_tracks %>%
+  arrange(desc(speechiness)) %>% 
+  slice(1:5)
+print(speechy[,c("track.name", "speechiness")])
+
+# Find my livest songs
+liveness <- elke_liked_tracks %>%
+  arrange(desc(liveness)) %>% 
+  slice(1:5)
+print(liveness[,c("track.name", "liveness")])
+
+# Find my highest tempo songs
+tempo <- elke_liked_tracks %>%
+  arrange(desc(tempo)) %>% 
+  slice(1:5)
+print(tempo[,c("track.name", "tempo")])
+
+# Find my longest songs
+length <- elke_liked_tracks %>%
+  arrange(desc(duration_ms)) %>% 
+  slice(1:5)
+print(length[,c("track.name", "duration_ms")])
+```
+
+```{r}
+# Danceablility Plot
+ggplot(data = all_tracks, aes(x = danceability, color = listener, fill= listener)) +
+  geom_density(adjust=1.5, alpha=.6) +
+  theme_minimal() +
+  scale_fill_manual(values = c("#69b3a2", "#404080")) +
+  scale_color_manual(values = c("#69b3a2", "#404080"))
+
+# Acousitcness Plot
+ggplot(data = all_tracks, aes(x = acousticness, color = listener, fill= listener)) +
+  geom_density(adjust=1.5, alpha=.6) +
+  theme_minimal() +
+  scale_fill_manual(values = c("#69b3a2", "#404080")) +
+  scale_color_manual(values = c("#69b3a2", "#404080"))
+  
+# Energy Plot
+ggplot(data = all_tracks, aes(x = energy, color = listener, fill= listener)) +
+  geom_density(adjust=1.5, alpha=.6) +
+  theme_minimal() +
+  scale_fill_manual(values = c("#69b3a2", "#404080")) +
+  scale_color_manual(values = c("#69b3a2", "#404080"))
+
+# Speechiness Plot
+ggplot(data = all_tracks, aes(x = speechiness, color = listener, fill= listener)) +
+  geom_density(adjust=1.5, alpha=.6) +
+  theme_minimal() +
+  scale_fill_manual(values = c("#69b3a2", "#404080")) +
+  scale_color_manual(values = c("#69b3a2", "#404080"))
+
+# Instrumentalness Plot
+ggplot(data = all_tracks, aes(x = instrumentalness, color = listener, fill= listener)) +
+  geom_density(adjust=1.5, alpha=.6) +
+  theme_minimal() +
+  scale_fill_manual(values = c("#69b3a2", "#404080")) +
+  scale_color_manual(values = c("#69b3a2", "#404080"))
+
+# Duration Plot
+ggplot(data = all_tracks, aes(x = duration_ms, color = listener, fill= listener)) +
+  geom_density(adjust=1.5, alpha=.6) +
+  theme_minimal() +
+  scale_fill_manual(values = c("#69b3a2", "#404080")) +
+  scale_color_manual(values = c("#69b3a2", "#404080"))
+```
+
+```{r}
+# t.test on lewis vs elke danciness
+t.test(danceability ~ listener, data = all_tracks)
+
+# t.test on lewis vs elke acousticness
+t.test(acousticness ~ listener, data = all_tracks)
+
+# t.test on lewis vs elke energy
+t.test(energy ~ listener, data = all_tracks)
+
+# t.test on lewis vs elke speechiness
+t.test(speechiness ~ listener, data = all_tracks)
+
+# t.test on lewis vs elke instrumentalness
+t.test(instrumentalness ~ listener, data = all_tracks)
+
+# t.test on lewis vs elke duration
+t.test(duration_ms ~ listener, data = all_tracks)
+```
+
+## **Modeling**
+
+Create four models, that predict whether a track belongs to you or your partner's collection.
+
+Then validate and compare the performance of the two models you have created.
+
+Make sure to use appropriate resampling to select the best version of each algorithm to compare and some appropriate visualization of your results.
+
+Create four final candidate models:
+
+1\. k-nearest neighbor
+
+2\. decision tree
+
+3\. bagged tree
+
+-   bag_tree()
+
+-   Use the "times =" argument when setting the engine during model specification to specify the number of trees. The rule of thumb is that 50-500 trees is usually sufficient. The bottom of that range should be sufficient here.
+
+4\. random forest
+
+-   rand_forest()
+
+-   m_try() is the new hyperparameter of interest for this type of model. Make sure to include it in your tuning process
+
+Go through the modeling process for each model:
+
+Preprocessing. You can use the same recipe for all the models you create.
+
+Resampling. Make sure to use appropriate resampling to select the best version created by each algorithm.
+
+Tuning. Find the best values for each hyperparameter (within a reasonable range).
+
+Compare the performance of the four final models you have created.
+
+Use appropriate performance evaluation metric(s) for this classification task. A table would be a good way to display your comparison. Use at least one visualization illustrating your model results.
+
+### K-Nearest Neighbor
+
+```{r}
+# If feature is a factor DON'T order
+tracks <- all_tracks %>% mutate_if(is.ordered, .funs = factor, ordered = F) %>% 
+  select(-track.name) %>% 
+  select(-primary_artist)
+
+tracks$listener <- as.factor(tracks$listener)
+```
+
+```{r}
+set.seed(123)
+#initial split of data, default 70/30
+tracks_split <- initial_split(tracks, 0.7)
+tracks_test <- testing(tracks_split)
+tracks_train <- training(tracks_split)
+```
+
+```{r}
+# Preprocessing
+tracks_recipe <- recipe(listener ~ ., data = tracks_train) %>% # listener is outcome variable, use all variables
+  #step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) %>% 
+  step_normalize(all_numeric(), -all_outcomes()) %>% # normalize for knn model
+  prep()
+
+# Bake
+tracks_train <- bake(tracks_recipe, tracks_train)
+tracks_test <- bake(tracks_recipe, tracks_test)
+```
+
+```{r}
+set.seed(123)
+# 10-fold CV on the training dataset
+cv_folds <-tracks_train %>% 
+  vfold_cv(v=10) #10 is default
+cv_folds
+```
+
+```{r}
+# Define our KNN model with tuning
+knn_spec_tune <- nearest_neighbor(neighbors = tune()) %>% # tune k
+  set_mode("classification") %>% 
+  set_engine("kknn")
+
+# Check the model
+knn_spec_tune
+```
+
+```{r}
+# Define a new workflow
+wf_knn_tune <- workflow() %>% 
+  add_model(knn_spec_tune) %>% 
+  add_recipe(tracks_recipe)
+    
+# Fit the workflow on our predefined folds and hyperparameters
+fit_knn_cv <- wf_knn_tune %>% 
+  tune_grid( 
+    cv_folds, # does tuning based on folds
+    grid = data.frame(neighbors = c(1,5,seq(10,100,10)))) # K=1, K=5, K=10, K=20..., K=100. For each different value for k parameter, model will try it on all folds
+    
+# Check the performance with collect_metrics()
+print(n = 24, fit_knn_cv %>% collect_metrics())
+```
+
+```{r}
+# The final workflow for our KNN model
+final_wf <-
+  wf_knn_tune %>% 
+  finalize_workflow(select_best(fit_knn_cv))
+
+# Check out the final workflow object
+final_wf
+```
+
+```{r}
+# Fitting our final workflow
+final_fit <- final_wf %>% 
+  fit(data = tracks_train)
+# Examine the final workflow
+final_fit
+```
+
+```{r}
+# Fit the model to the test data
+tracks_pred <- predict(final_fit, new_data = tracks_test)
+# Bind to track dataframe
+tracks_final <- cbind(tracks_test, tracks_pred)
+# Build a confusion matrix
+con_matrix <- tracks_final %>%
+  select(listener, .pred_class) %>%
+  table()
+
+# print table
+con_matrix
+
+# Calculate dummy classifier
+dummy <- nrow(lewis_liked_tracks) / (nrow(lewis_liked_tracks) + nrow(elke_liked_tracks))
+print(dummy)
+```
+
+```{r}
+# Write over 'final_fit' with this last_fit() approach
+final_fit <- final_wf %>% last_fit(tracks_split)
+# Collect metrics on the test data!
+tibble <- final_fit %>% collect_metrics()
+tibble
+
+final_accuracy <- tibble %>%
+  filter(.metric == "accuracy") %>%
+  pull(.estimate)
+
+print(paste0("We see here that our k-nearest neighbors model had a higher accuracy at predicting listener than the dummy classifier. The accuracy of the model was ", round(final_accuracy, 3), " and the dummy classifier accuracy was ", round(dummy, 3), "."))
+```
+
+**We see here that our k-nearest neighbors model had a higher accuracy at predicting listener than the dummy classifier.**
+
+### Decision Tree
+
+```{r}
+#Preprocess the data
+listener_rec <- recipe(listener~., data = tracks_train) %>% 
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) %>% 
+  step_normalize(all_numeric(), -all_outcomes())
+```
+
+```{r}
+#Tell the model that we are tuning hyperparams
+tree_spec_tune <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth = tune(),
+  min_n = tune()) %>% 
+  set_engine("rpart") %>% 
+  set_mode("classification")
+
+tree_grid <- grid_regular(cost_complexity(), tree_depth(), min_n(), levels = 5)
+
+tree_grid
+```
+
+```{r}
+wf_tree_tune <- workflow() %>% 
+  add_recipe(listener_rec) %>% 
+  add_model(tree_spec_tune)
+```
+
+```{r}
+#set up k-fold cv. This can be used for all the algorithms
+listener_cv = tracks_train %>% 
+  vfold_cv(v = 5)
+listener_cv
+```
+
+```{r}
+doParallel::registerDoParallel() #build trees in parallel
+#200s
+tree_rs <- tune_grid(
+  wf_tree_tune,
+  listener~.,
+  resamples = listener_cv,
+  grid = tree_grid,
+  metrics = metric_set(accuracy)
+)
+tree_rs
+```
+
+```{r}
+#Use autoplot() to examine how different parameter configurations relate to accuracy
+autoplot(tree_rs) + theme_light()
+```
+
+```{r}
+# select best hyperparameterw
+show_best(tree_rs)
+select_best(tree_rs)
+```
+
+```{r}
+final_tree <- finalize_model(tree_spec_tune, select_best(tree_rs))
+```
+
+```{r}
+final_tree_fit <- last_fit(final_tree, listener~., tracks_split) # does training fit then final prediction as well
+final_tree_fit$.predictions
+final_tree_fit$.metrics
+
+tibble_tree <- final_tree_fit %>% collect_metrics()
+tibble_tree
+
+final_tree_accuracy <- tibble_tree %>%
+  filter(.metric == "accuracy") %>%
+  pull(.estimate)
+
+print(paste0("We see here that our decision tree model had a lower accuracy at predicting listener than the dummy classifier or the k-nearest neighbor model. The accuracy of the decision tree was ", round(final_tree_accuracy, 3), "."))
+```
+
+### Bagging
+
+```{r}
+set.seed(123)
+# Bagging specifications
+bag_spec <- 
+  bag_tree(cost_complexity = tune(),
+  tree_depth = tune(),
+  min_n = tune()) %>% 
+  set_engine("rpart", times = 75) %>% # 25 ensemble members 
+  set_mode("classification")
+
+bag_grid <- grid_regular(cost_complexity(), tree_depth(), min_n(), levels = 5)
+
+bag_grid
+```
+
+```{r}
+wf_bag <- workflow() %>% 
+  add_recipe(listener_rec) %>% 
+  add_model(bag_spec)
+```
+
+```{r}
+doParallel::registerDoParallel() #build trees in parallel
+
+bag_rs <- tune_grid(
+  wf_bag,
+  listener~.,
+  resamples = listener_cv,
+  grid = bag_grid,
+  metrics = metric_set(accuracy)
+)
+
+bag_rs
+```
+
+```{r}
+# Use autoplot() to examine how different parameter configurations relate to accuracy 
+autoplot(bag_rs) + theme_light()
+```
+
+```{r}
+# Select hyperparameters
+show_best(bag_rs)
+select_best(bag_rs)
+```
+
+```{r}
+final_bag <- finalize_model(bag_spec, select_best(bag_rs))
+```
+
+```{r}
+final_bag_fit <- last_fit(final_bag, listener~., tracks_split) # does training fit then final prediction as well
+final_bag_fit$.predictions
+final_bag_fit$.metrics
+
+tibble_bag <- final_bag_fit %>% collect_metrics()
+tibble_bag
+
+final_bag_accuracy <- tibble_bag %>%
+  filter(.metric == "accuracy") %>%
+  pull(.estimate)
+
+print(paste0("We see here that our bagging model had a higher accuracy at predicting listener than the decision tree or dummy classifier. The accuracy of the bagging was ", round(final_bag_accuracy, 3), ". This is still lower than the knn model."))
+```
+
+### Random Forest
+
+```{r}
+set.seed(123)
+# Bagging specifications
+forest_spec <- 
+  rand_forest(min_n = tune(),
+  mtry = tune(),
+  trees = tune()) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+forest_grid <- grid_regular(min_n(), mtry(c(1,13)), trees(), levels = 5)
+
+forest_grid
+```
+
+```{r}
+wf_forest <- workflow() %>% 
+  add_recipe(listener_rec) %>% 
+  add_model(forest_spec)
+```
+
+```{r}
+doParallel::registerDoParallel() #build trees in parallel
+
+forest_rs <- tune_grid(
+  wf_forest,
+  listener~.,
+  resamples = listener_cv,
+  grid = forest_grid,
+  metrics = metric_set(accuracy)
+)
+
+forest_rs
+```
+
+```{r}
+# Use autoplot() to examine how different parameter configurations relate to accuracy 
+autoplot(forest_rs) + theme_light()
+```
+
+```{r}
+# Select hyperparameters
+show_best(forest_rs)
+select_best(forest_rs)
+```
+
+```{r}
+final_forest <- finalize_model(forest_spec, select_best(forest_rs))
+```
+
+```{r}
+final_forest_fit <- last_fit(final_forest, listener~., tracks_split) # does training fit then final prediction as well
+final_forest_fit$.predictions
+final_forest_fit$.metrics
+
+tibble_forest <- final_forest_fit %>% collect_metrics()
+tibble_forest
+
+final_forest_accuracy <- tibble_forest %>%
+  filter(.metric == "accuracy") %>%
+  pull(.estimate)
+
+print(paste0("We see here that our random forest had the highest accuracy at predicting listener than the other models. The accuracy of the forest was ", round(final_forest_accuracy, 3), "."))
+```
+
+```{r}
+model <- c("Dummy", "KNN", "Decision Tree", "Bagging", "Random Forest")
+accuracy <- c(dummy, final_accuracy, final_tree_accuracy, final_bag_accuracy, final_forest_accuracy)
+
+accuracy_df <- data.frame(model, accuracy)
+print(accuracy_df)
+
+ggplot(accuracy_df, aes(x = model, y = accuracy)) +
+  geom_col(fill = "#69b3a2") +
+  theme_minimal()
+```
+
+**From this lab, we can see that using bagging and a random forest greatly improves the accuracy of a decision tree. However, this came with the tradeoff of computation time. It took around 30 minutes to build trees in parallel, whereas it only took a few seconds to make my single decision tree. The k-nearest neighbor algorithm also worked very well here and had essentially the same accuracy as the random forest.**

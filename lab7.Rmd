@@ -1,0 +1,630 @@
+---
+title: "lab7"
+author: "Lewis White"
+date: "2023-03-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tictoc) #timing functions/loops
+library(xgboost) #gradient boosting 
+library(vip) #for determining variable importance
+library(pROC) #for calculating roc auc manually for the eval data
+library(tidyverse) #cleaning data, ggplot, etc 
+library(tidymodels) #for modeling/statistical analysis
+library(rsample) #for splitting data into train / test
+library(recipes) #for creating the recipe for ML
+#library(skimr) #for data exploration / early summary stats and viz
+library(kknn) #for KNN modeling
+library(plotly) #for data viz
+library(ggpubr) #for data viz
+library(here) #for simplifying file path navigation
+library(baguette) #for bagging decision trees
+library(ranger) # engine for random forests
+library(kableExtra) #for creating a formatted table
+library(glmnet) # for regularized regression 
+library(caret) #streamline modeling process
+library(corrplot) #correlation plots
+library(beepr)
+```
+
+### read in the data 
+```{r}
+#read in the training data
+dic_data <- read_csv(here("lab7", "train.csv")) %>%
+  select(-"...13") %>%
+  rename(TA1 = TA1.x)
+
+#read in the evaluation data
+dic_eval <- read_csv(here("lab7", "test.csv"))
+
+#read in the sample submission
+dic_sample_submission <- read_csv(here("lab7", "sample_submission.csv"))
+
+#check out distribution of outcome variable DIC
+ggplot(data = dic_data, aes(x = DIC)) +
+  geom_histogram() + 
+  theme_bw() +
+  labs(title = "Histogram of DIC values")
+
+# Look at correlations between variables
+pairs(dic_train[,2:18], mar = c(1, 1, 1, 1), cex = 0.1)
+
+cor_matrix <- cor(dic_train)
+corrplot(cor_matrix)
+```
+
+
+```{r}
+#SPLITTING THE ORIGINAL TRAINING DATA INTO TRAINING DATA AND TEST DATA
+set.seed(123)
+
+dic_split <- initial_split(dic_data, prop = .80, strata = DIC) #sample size is just 1000, so I went with a 70% training 30% testing split
+dic_train <- training(dic_split)
+dic_test <- testing(dic_split)
+```
+
+```{r}
+#check classes of variables 
+lapply(dic_train, class) #all are numeric 
+```
+
+## Initial Linear model
+
+We thought it would make sense to start things off with a linear model that included all the predictors. It seemed to perform pretty well!
+
+```{r}
+# Start with a linear regression model even though variables are highly correlated
+lm <- lm(DIC ~ .-id, data = dic_train)
+
+# Predict
+lm_predictions <- predict(object = lm,
+                          newdata = dic_test)
+dic_test_lm <- cbind(dic_test, lm_predictions) # bind to data
+
+# Find RMSE
+sqrt(mean(lm$residuals^2))
+rmse(dic_test_lm$DIC, dic_test_lm$lm_predictions)
+```
+
+## Regularized Regression
+
+We then wanted to expand on the linear model and add in a coefficient penalty term. We tried ridge, lasso, and elastic net regularized regression. The lasso performed the best on the training/test data, but not as well as the initial linear model.
+
+```{r}
+## Setting up regularized regression 
+X <- model.matrix(DIC ~ ., data = dic_train)[,-1] #compare DIC to all other predictors in the data. [,-1] removes the id variable
+
+Y <- dic_train$DIC #assign DIC value to outcome vector Y
+
+#fit a ridge model, passing X,Y,alpha to glmnet()
+dic_ridge <- glmnet(x = X, 
+                        y = Y, 
+                        alpha = 0) #alpha = 0 indicates ridge regression 
+
+par(mfrow = c(1, 1))
+
+plot(dic_ridge, xvar = "lambda")
+title("Coefficient values as tuning parameter lambda increases", line = 3)
+
+#RIDGE REGRESSION
+cv_dic_ridge <- cv.glmnet(x = X,  
+                          y = Y,
+                          alpha = 0,
+                          nfolds = 10)
+
+cv_dic_ridge
+
+#LASSO REGRESSION
+cv_dic_lasso <- cv.glmnet(x = X,
+                          y = Y, 
+                          alpha = 1,
+                          nfolds = 10)
+
+cv_dic_lasso
+
+cv_dic_lasso$lambda.min
+
+
+#ELASTIC NET REGRESSION 
+cv_dic_elastic_net <- cv.glmnet(x = X, 
+                                y = Y, 
+                                alpha = 0.7,
+                                nfolds = 10)
+
+cv_dic_elastic_net
+
+#plotting MSE for the ridge, lasso, and elastic net
+par(mfrow = c(1, 3))
+plot(cv_dic_ridge, main = "Ridge penalty\n\n")  
+plot(cv_dic_lasso, main = "Lasso penalty\n\n") 
+plot(cv_dic_elastic_net, main = "Elastic Net\n\n")
+
+#checking out the min values 
+min(cv_dic_ridge$cvm) 
+min(cv_dic_lasso$cvm) 
+min(cv_dic_elastic_net$cvm) 
+
+#looks like lasso performed the best 
+```
+
+## TRY TUNING
+```{r}
+#using caret
+tuned_dic_glmnet <- train(
+  x = X,
+  y = Y,
+  method = "glmnet",
+  preProc = c("zv", "center", "scale"),
+  trControl = trainControl(method = "cv", number = 10),
+  tuneLength = 10
+)
+
+tuned_dic_glmnet$bestTune
+
+#plotting RMSE for various regularization parameters
+ggplot(tuned_dic_glmnet) +
+  theme_bw() +
+  labs(title = "RMSE for various regularization parameters")
+
+#checking out important features
+vip(tuned_dic_glmnet, num_features = 17, geom = "point") +
+  theme_bw() +
+  labs(title = "Variable Importance")
+```
+
+
+```{r}
+#TESTING THE BEST REGULARIZED REGRESSION MODEL
+pred <- predict(object = tuned_dic_glmnet, newdata = dic_test)
+
+test_Y <- dic_test$DIC
+
+library(Metrics)
+
+rmse(test_Y, pred) #7.688363
+```
+
+
+```{r}
+#Making predictions on the eval data
+pred_eval <- predict(object = tuned_dic_glmnet, newdata = dic_eval)
+
+#bind predictions to eval data
+reg_submission <- bind_cols(dic_eval, pred_eval) %>%
+  rename(DIC = ...18) %>%
+  select(id, DIC)
+
+write_csv(reg_submission, "jel_lasso.csv")
+```
+
+
+```{r}
+
+## Setting up regularized regression 
+X <- model.matrix(DIC ~ Lat_Dec + Lon_Dec + NO2uM + NO3uM + NH3uM + R_TEMP + R_Depth + R_DYNHT + R_Nuts + R_Oxy_micromol.Kg + PO4uM + SiO3uM + TA1 + Salinity1 +  NO3uM * R_Depth + NO2uM * R_Depth + NH3uM * R_Depth + R_Nuts * R_Depth + SiO3uM * R_Depth + NO3uM * R_Oxy_micromol.Kg + NO2uM * R_Oxy_micromol.Kg + NH3uM * R_Oxy_micromol.Kg + R_Nuts * R_Oxy_micromol.Kg + SiO3uM * R_Oxy_micromol.Kg + TA1 * Salinity1 + TA1 * R_Nuts + Lat_Dec * Lon_Dec + R_DYNHT * NO3uM + R_DYNHT * R_Oxy_micromol.Kg + R_TEMP * Salinity1, data = dic_train)[,-1] #compare DIC to all other predictors in the data. [,-1] removes the id variable
+
+Y <- dic_train$DIC #assign DIC value to outcome vector Y
+
+#LASSO REGRESSION
+cv_dic_lasso <- cv.glmnet(x = X,
+                          y = Y, 
+                          alpha = 1,
+                          nfolds = 10)
+
+cv_dic_lasso
+
+
+
+#using caret
+tuned_dic_glmnet <- train(
+  x = X,
+  y = Y,
+  method = "glmnet",
+  preProc = c("zv", "center", "scale"),
+  trControl = trainControl(method = "cv", number = 10),
+  tuneLength = 10
+)
+
+tuned_dic_glmnet$bestTune
+
+#plotting RMSE for various regularization parameters
+ggplot(tuned_dic_glmnet) +
+  theme_bw() +
+  labs(title = "RMSE for various regularization parameters")
+
+#checking out important features
+vip(tuned_dic_glmnet, num_features = 35, geom = "point") +
+  theme_bw() +
+  labs(title = "Variable Importance")
+
+```
+
+## KNN model
+
+We also tried K-nearest neighbors for our model prediction. Again, this model did not perform as well as our initial linear regression. 
+
+```{r label = "KNN Model Specification"}
+# Specify the model
+knn_spec <- nearest_neighbor(
+  neighbors = tune(),
+  weight_func = "optimal") |> 
+  set_engine("kknn") |> 
+  set_mode("regression")
+```
+
+```{r label = "KNN tuning grid"}
+# Create tuning grid
+# I tried up to 400 but the most neighbors in the best performing model never had more than 20 neighbors. 
+knn_grid <- data.frame(neighbors = c(seq(1,50,1)))
+
+```
+
+```{r label = "KNN define workflow"}
+# Define a workflow
+knn_wf <- workflow() |> 
+  add_model(knn_spec) |>
+  add_recipe(original_recipe)
+```
+
+```{r label = "KNN model tune"}
+# set seed
+set.seed(456)
+
+# Fit the workflow on our predefined folds and hyperparameters
+knn_fit <- knn_wf |> 
+  tune_grid(
+    cv_folds, 
+    grid = knn_grid # This is where the computational cost explodes.
+  ) |> 
+  select_best()
+  
+
+knn_fit
+```
+
+```{r label = "KNN tune model spec"}
+# Specify the model
+knn_spec <- nearest_neighbor(
+  neighbors = knn_fit$neighbors,
+  weight_func = "optimal") |> 
+  set_engine("kknn") |> 
+  set_mode("regression")
+```
+
+```{r label = "KNN create and fit workflow"}
+knn_tune_wf <- workflow() |> 
+  add_model(knn_spec) |> 
+  add_recipe(original_recipe)
+
+knn_final_wf <- fit(knn_tune_wf, dic_train)
+``` 
+
+```{r label = "generate predictions on the test data"}
+#generate predictions
+
+eval_pred <- predict(knn_final_wf, 
+                     new_data = dic_test)
+
+# bind back to dic_test
+eval_data_pred <- cbind(dic_test, eval_pred) 
+
+# assess rmse
+eval_accuracy <- rmse(eval_data_pred, truth = DIC, estimate = .pred)
+
+eval_accuracy
+```
+
+```{r label = "Create predictions on test"}
+
+#generate predictions
+
+eval_pred <- predict(knn_final_wf, 
+                     new_data = dic_eval)
+
+# bind back to dic_test
+eval_data_pred <- cbind(dic_eval, eval_pred) |> 
+  select(id, .pred) |> 
+  rename("DIC" = .pred)
+  
+
+write_csv(eval_data_pred, "jel_KNN.csv")
+
+```
+
+## RANDOM FORESTS 
+
+Up next: Random Forests. The tuning process took quite a long time to run and the model did not perform as well as our initial linear regression, so we decided to just comment out this code. 
+
+```{r label = "Random Forest Model Specification"}
+# # Specify the bagged tree model, use tune for all parameters. 
+# random_forest_spec <- rand_forest(mode = "regression",
+#                         mtry = tune(),          
+#                         min_n = tune(),
+#                         trees = tune(),
+#                         ) |> 
+#   set_engine("ranger")
+```
+
+```{r label = "Random forest workflow"}
+# # Create random forest workflow 
+# random_forest_wf <- workflow() |> 
+#   add_recipe(original_recipe) |> 
+#   add_model(random_forest_spec)
+```
+
+```{r label = "Random forest grid"}
+# # create grid for random forest tuning parameters. 
+# random_forest_grid <- 
+#   grid_regular(
+#     min_n(), 
+#     trees(),
+#     finalize(mtry(), select(dic_train, -DIC)),
+#     levels = 25)
+```
+
+#### tune
+
+```{r label = "Random forest tune"}
+# doParallel::registerDoParallel() #build trees in parallel
+# set.seed(345)
+# tic()
+# rand_forest_tune <- tune_grid(
+#   random_forest_wf, 
+#   resamples = cv_folds, 
+#   grid = random_forest_grid, 
+#   metrics = metric_set(rmse)
+# )
+# beepr::beep("treasure")
+# toc()
+# 
+# show_best(rand_forest_tune)
+```
+
+
+## BOOST 
+
+Gradient boosting also provided evidence that a more complicated model isn't always a better one. Yet again, the initial linear regression outperformed boosting in terms of the RMSE value. 
+
+```{r}
+#SPLITTING THE ORIGINAL TRAINING DATA INTO TRAINING DATA AND TEST DATA
+set.seed(123)
+
+dic_split <- initial_split(dic_data, prop = .80, strata = DIC) #sample size is just 1000, so I went with a 70% training 30% testing split
+dic_train <- training(dic_split)
+dic_test <- testing(dic_split)
+```
+
+```{r}
+#create recipe for pre-processing
+dic_recipe <- recipe(DIC ~ ., data = dic_train) %>%
+  step_normalize(all_numeric(), -all_outcomes(), -id) %>% #normalize numeric to make sure scale is okay
+  prep()
+
+set.seed(123)
+cv_folds <- dic_train %>%
+  vfold_cv(v = 10, strata = DIC)
+```
+
+```{r}
+#model specification just tuning the learning rate
+
+dic_spec_lr_tune <- boost_tree(trees = 3000, #starting with large number of trees (e.g. 3000 is recommended)
+                               learn_rate = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("xgboost")
+
+#create a workflow
+dic_lr_tune_wf <- workflow() %>%
+  add_recipe(dic_recipe) %>%
+  add_model(dic_spec_lr_tune)
+
+
+#creating a gird of learning rate values to tune so we can find optimal value
+learn_rate_grid <- expand.grid(learn_rate = seq(0.00001, 0.5, length.out = 50))
+
+tic() #start timer
+
+#set up code to run using parallel processing
+doParallel::registerDoParallel() 
+
+set.seed(123)
+
+#tuning the learn rate
+boost_rs <- tune_grid(
+  dic_lr_tune_wf,
+  resamples = cv_folds, #resamples to use
+  grid = learn_rate_grid#, #grid to try
+  #metrics = metric_set(rmse) #how to assess which combinations are best 
+)
+
+toc() #end timer
+
+show_best(boost_rs) #5.29
+```
+
+```{r}
+# XGBoost model specification
+dic_tree_param_spec <- 
+  parsnip::boost_tree(
+    mode = "regression",
+    trees = 3000,
+    min_n = tune(),
+    tree_depth = tune(),
+    loss_reduction = tune(),
+    learn_rate = select_best(boost_rs, metric = "rmse")$learn_rate) %>%
+    set_engine("xgboost")
+
+
+# grid specification
+xgboost_tree_params <- 
+  dials::parameters(
+    min_n(),
+    tree_depth(),
+    loss_reduction())
+
+
+#grid_max_entropy:  construct parameter grids that try to cover the parameter space such that any portion of the space has an observed combination that is not too far from it.
+xgboost_tree_params_grid <- 
+  dials::grid_max_entropy( 
+    xgboost_tree_params,  
+    size = 100 #number of different parameter combinations 
+  )
+
+xgboost_tree_params_wf <- 
+  workflows::workflow() %>%
+  add_model(dic_tree_param_spec) %>% 
+  add_recipe(dic_recipe)
+
+tic()
+
+set.seed(123)
+
+# hyperparameter tuning
+xgboost_tree_params_tuned <- tune::tune_grid(
+  object = xgboost_tree_params_wf,
+  resamples = cv_folds,
+  grid = xgboost_tree_params_grid
+  #control = tune::control_grid(verbose = TRUE)
+)
+
+toc()
+```
+
+
+```{r}
+show_best(xgboost_tree_params_tuned)
+```
+
+## stochastic tuning
+
+```{r}
+#goal: tune stochastic parameters mtry and sample size 
+
+# XGBoost model specification
+dic_stochastic_spec <- 
+  parsnip::boost_tree(
+    mode = "regression",
+    trees = 3000, #number of trees contained in the ensemble
+    min_n = select_best(xgboost_tree_params_tuned, metric = "rmse")$min_n, #minimum number of data points in a node that is required for node to be split further
+    tree_depth = select_best(xgboost_tree_params_tuned, metric = "rmse")$tree_depth, #maximum depth of tree (i.e. number of splits)
+    learn_rate = select_best(boost_rs, metric = "rmse")$learn_rate, #the rate at which the bosting algorithm adapts from iteration-to-iteration
+    loss_reduction = select_best(xgboost_tree_params_tuned, metric = "rmse")$loss_reduction, #the reduction in the loss function required to split further
+    mtry = tune(), #number predictors randomly sampled at each split
+    sample_size = tune(), #the amount of data exposed to the fitting routine
+    stop_iter = tune()) %>% #the number of iterations without improvement before stopping 
+    set_engine("xgboost")
+
+
+# grid specification
+xgboost_stochastic_params <- 
+  dials::parameters(finalize(mtry(), select(dic_train, -DIC)), #mtry values will range from 1 to the number of predictors included in the model
+                    sample_size = sample_prop(c(.4, .9)), #sample between 40% and 90% of observations 
+                    stop_iter()) #The number of iterations without improvement before stopping
+
+xgboost_stochastic_grid <- 
+  dials::grid_max_entropy(
+    xgboost_stochastic_params, 
+    size = 100
+  )
+
+#create workflow
+xgboost_stochastic_wf <- 
+  workflows::workflow() %>%
+  add_model(dic_stochastic_spec) %>% 
+  add_recipe(dic_recipe)
+
+
+
+set.seed(123)
+
+
+# hyperparameter tuning
+xgboost_stochastic_tuned <- tune::tune_grid(
+  object = xgboost_stochastic_wf,
+  resamples = cv_folds,
+  grid = xgboost_stochastic_grid
+  #control = tune::control_grid(verbose = TRUE)
+)
+```
+
+```{r}
+show_best(xgboost_stochastic_tuned)
+```
+
+```{r}
+full_model_spec <- 
+  parsnip::boost_tree(
+    mode = "regression",
+    trees = 3000, #number of trees contained in the ensemble
+    min_n = select_best(xgboost_tree_params_tuned, metric = "rmse")$min_n, #minimum number of data points in a node that is required for node to be split further
+    tree_depth = select_best(xgboost_tree_params_tuned, metric = "rmse")$tree_depth, #maximum depth of tree (i.e. number of splits)
+    learn_rate = select_best(boost_rs, metric = "rmse")$learn_rate, #the rate at which the bosting algorithm adapts from iteration-to-iteration
+    mtry = select_best(xgboost_stochastic_tuned, metric = "rmse")$mtry, #number predictors randomly sampled at each split
+    loss_reduction = select_best(xgboost_tree_params_tuned, metric = "rmse")$loss_reduction, #the reduction in the loss function required to split further
+    sample_size = select_best(xgboost_stochastic_tuned, metric = "rmse")$sample_size, #the amount of data exposed to the fitting routine
+    stop_iter = select_best(xgboost_stochastic_tuned, metric = "rmse")$stop_iter) %>% #the number of iterations without improvement before stopping 
+    set_engine("xgboost")
+
+#final workflow
+final_wf <- workflow() %>%
+  add_recipe(dic_recipe) %>%
+  add_model(full_model_spec)
+
+set.seed(123)
+#pop my spec into a workflow for final fit 
+final_fit <- last_fit(final_wf, dic_split)
+
+#check out the final metrics
+final_fit %>% collect_metrics()
+```
+
+
+```{r}
+#fit the final model on the evaluation data 
+set.seed(123)
+
+#prepare the final model
+final_fit_train <- fit(final_wf, dic_train)
+
+#make predictions ont he eval data 
+boost_predictions <- predict(final_fit_train, new_data = dic_eval)
+
+#add predictions to eval data
+boost_submission <- bind_cols(dic_eval, boost_predictions) %>%
+  rename(DIC = .pred) %>%
+  select(id, DIC)
+
+write_csv(reg_submission, "jel_boost.csv")
+```
+
+## FINAL MODEL: 
+
+Because multiple linear regression was the most successful model, we decided to elaborate on that model by adding interaction terms based on our knowledge of ocean chemistry. For example, we interacted nutrients with depth because at different depths there are different levels of activity -- closer to the surface there are more photosynthesizers etc.
+
+```{r}
+#building the final model
+lm_4 <- lm(DIC ~ Lat_Dec + Lon_Dec + NO2uM + NO3uM + NH3uM + R_TEMP + R_Depth + R_DYNHT + R_Nuts + R_Oxy_micromol.Kg + PO4uM + SiO3uM + TA1 + Salinity1 +  NO3uM * R_Depth + NO2uM * R_Depth + NH3uM * R_Depth + R_Nuts * R_Depth + SiO3uM * R_Depth + NO3uM * R_Oxy_micromol.Kg + NO2uM * R_Oxy_micromol.Kg + NH3uM * R_Oxy_micromol.Kg + R_Nuts * R_Oxy_micromol.Kg + SiO3uM * R_Oxy_micromol.Kg + TA1 * Salinity1 + TA1 * R_Nuts + R_TEMP * Salinity1, data = dic_train)
+
+# Predict
+lm_predictions_4 <- predict(object = lm_4,
+                          newdata = dic_test)
+dic_test_lm_4 <- cbind(dic_test, lm_predictions_4) # bind to data
+
+# Find RMSE
+sqrt(mean(lm_4$residuals^2))
+rmse(dic_test_lm_4$DIC, dic_test_lm_4$lm_predictions_4)
+
+lm_eval_4 <- predict(object = lm_4,
+                   newdata = dic_eval)
+dic_eval_lm_4 <- cbind(dic_eval, lm_eval_4)
+dic_sub_lm_4 <- dic_eval_lm_4 %>% 
+  select(id, lm_eval_4) %>% 
+  rename(DIC = lm_eval_4)
+
+write_csv(dic_sub_lm_4, "jel_lm4.csv")
+```

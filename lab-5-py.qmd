@@ -1,0 +1,73 @@
+---
+title: "Lab 5 Python"
+format: html
+editor: visual
+---
+
+This week's lab is a musical lab. You'll be requesting data from the Spotify API and using it to build k-nearest neighbor and decision tree models.
+
+In order to use the Spotify you must have a Spotify account. If you don't have one, sign up for a free one here: <https://www.spotify.com/us/signup>
+
+Once you have an account, go to Spotify for developers (<https://developer.spotify.com/>) and log in. Click the green "Create a Client ID" button to fill out the form to create an app create an app so you can access the API.
+
+On your developer dashboard page, click on the new app you just created. On the app's dashboard page you will find your Client ID just under the header name of your app. Click "Show Client Secret" to access your secondary Client ID. When you do this you'll be issued a Spotify client ID and client secret key.
+
+You have two options for completing this lab.
+
+**Option 1**: **Classify by users**. Build models that predict whether a given song will be in your collection vs. a partner in class. This requires that you were already a Spotify user so you have enough data to work with. You will download your data from the Spotify API and then exchange with another member of class.
+
+**Option 2**: **Classify by genres**. Build models that predict which genre a song belongs to. This will use a pre-existing Spotify dataset available from Kaggle.com (<https://www.kaggle.com/datasets/mrmorj/dataset-of-songs-in-spotify>)
+
+```{python}
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+import numpy as np
+import pandas as pd
+import sklearn
+```
+
+Client ID and Client Secret are required to create and access token that is required to interact with the API. You can set them as system values so we don't have to do provide them each time.
+
+access_token \<- get_spotify_access_token() #takes ID and SECRET, sends to Spotify and receives an access token
+
+> *This may result in an error:*
+>
+> INVALID_CLIENT: Invalid redirect URI
+>
+> *This can be resolved by editing the callback settings on your app. Go to your app and click "Edit Settings". Under redirect URLs paste this: <http://localhost:1410/> and click save at the bottom.*
+
+**Option 1: Data Preparation**
+
+You can use get_my_saved_tracks() to request all your liked tracks. It would be good if you had at least 150-200 liked tracks so the model has enough data to work with. If you don't have enough liked tracks, you can instead use get_my_recently_played(), and in that case grab at least 500 recently played tracks if you can.
+
+The Spotify API returns a dataframe of tracks and associated attributes. However, it will only return up to 50 (or 20) tracks at a time, so you will have to make multiple requests. Use a function to combine all your requests in one call.
+
+Once you have your tracks, familiarize yourself with this initial dataframe. You'll need to request some additional information for the analysis. If you give the API a list of track IDs using get_track_audio_features(), it will return an audio features dataframe of all the tracks and some attributes of them.
+
+These track audio features are the predictors we are interested in, but this dataframe doesn't have the actual names of the tracks. Append the 'track.name' column from your favorite tracks database.
+
+Find a class mate whose data you would like to use. Add your partner's data to your dataset. Create a new column that will contain the outcome variable that you will try to predict. This variable should contain two values that represent if the track came from your data set or your partner's.
+
+**Option 2: Data preparation**
+
+Download the Spotify dataset from <https://www.kaggle.com/datasets/mrmorj/dataset-of-songs-in-spotify>
+
+Inspect the data. Choose two genres you'd like to use for the classification task. Filter down the data to include only the tracks of that genre.
+
+##Data Exploration (both options)
+
+Let's take a look at your data. Do some exploratory summary stats and visualization.
+
+For example: What are the most danceable tracks in your dataset? What are some differences in the data between users (Option 1) or genres (Option 2)?
+
+### **Modeling**
+
+Create two models, a k-nearest neighbor model and a decision tree model that predict whether a track belongs to:
+
+1.  you or your partner's collection
+
+2.  genre 1 or genre 2
+
+Then validate and compare the performance of the two models you have created.
+
+Make sure to use appropriate resampling to select the best version of each algorithm to compare and some appropriate visualization of your results.

@@ -1,0 +1,160 @@
+---
+title: "Final Lab"
+author: "Elke Windschitll"
+date: "2023-03-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidymodels)
+library(corrplot)
+library(stats)
+library(Metrics)
+```
+
+```{r}
+# Read in training data
+dic_data <- read_csv("train.csv") %>% 
+  select(-"...13") %>% 
+  rename(TA1 = TA1.x)
+
+# Read in testing data
+dic_eval <- read_csv("test.csv") 
+```
+
+```{r}
+set.seed(123)
+# Split data
+dic_split <- initial_split(data = dic_data, 
+                       prop = .8, 
+                       strata = DIC)
+dic_split
+dic_train <- training(dic_split) 
+dic_test  <- testing(dic_split)
+```
+
+
+```{r}
+# Look at distribution of DIC
+ggplot(dic_train, aes(x = DIC)) +
+  geom_histogram() + 
+  theme_minimal()
+
+# Look at correlations between variables
+pairs(dic_train[,7:18], mar = c(1, 1, 1, 1), cex = 0.1)
+
+cor_matrix <-cor(dic_train)
+corrplot(cor_matrix)
+```
+
+
+```{r}
+set.seed(123)
+
+# 10-fold CV on the training dataset
+cv_folds <- dic_train %>% 
+  vfold_cv(v=10,
+           strata = DIC) #10 is default
+cv_folds
+
+# Make a recipe
+rec <- recipe(DIC ~ ., data = dic_train) %>% 
+  # step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) %>% 
+  step_normalize(all_numeric(), -all_outcomes(), -id) %>%
+  prep(training = train_dat, retain = TRUE)
+
+baked_dat <- bake(rec, dic_train)
+```
+ 
+```{r}
+# Start with a linear regression model even though variables are highly correlated
+lm <- lm(DIC ~ .-id, data = dic_train)
+
+# Predict
+lm_predictions <- predict(object = lm,
+                          newdata = dic_test)
+dic_test_lm <- cbind(dic_test, lm_predictions) # bind to data
+
+# Find RMSE
+sqrt(mean(lm$residuals^2))
+rmse(dic_test_lm$DIC, dic_test_lm$lm_predictions)
+```
+
+```{r}
+lm_2 <- lm(DIC ~ PO4uM + R_Oxy_micromol.Kg + R_Sal + SiO3uM + NO3uM + Salinity1 + R_Depth, data = dic_train)
+
+# Predict
+lm_predictions_2 <- predict(object = lm_2,
+                          newdata = dic_test)
+dic_test_lm_2 <- cbind(dic_test, lm_predictions_2) # bind to data
+
+# Find RMSE
+sqrt(mean(lm_2$residuals^2))
+rmse(dic_test_lm_2$DIC, dic_test_lm_2$lm_predictions)
+
+```
+
+```{r}
+lm_eval <- predict(object = lm,
+                   newdata = dic_eval)
+dic_eval_lm <- cbind(dic_eval, lm_eval)
+dic_sub1 <- dic_eval_lm %>% 
+  select(id, lm_eval) %>% 
+  rename(DIC = lm_eval)
+
+write_csv(dic_sub1, "jel_lm.csv")
+
+```
+
+```{r}
+# Because multiple linear regression was the most successful model, we decided to elaborate on that model by adding interaction terms based on our knowledge of ocean chemistry. For example, we interacted nutrients with depth because at different depths there are different levels of activity -- closer to the surface there are more photosynthesizers etc.
+
+lm_3 <- lm(DIC ~ Lat_Dec + Lon_Dec + NO2uM + NO3uM + NH3uM + R_TEMP + R_Depth + R_DYNHT + R_Nuts + R_Oxy_micromol.Kg + PO4uM + SiO3uM + TA1 + Salinity1 +  NO3uM * R_Depth + NO2uM * R_Depth + NH3uM * R_Depth + R_Nuts * R_Depth + SiO3uM * R_Depth + NO3uM * R_Oxy_micromol.Kg + NO2uM * R_Oxy_micromol.Kg + NH3uM * R_Oxy_micromol.Kg + R_Nuts * R_Oxy_micromol.Kg + SiO3uM * R_Oxy_micromol.Kg + TA1 * Salinity1 + TA1 * R_Nuts + Lat_Dec * Lon_Dec + Lat_Dec * R_TEMP + R_DYNHT * NO3uM + R_DYNHT * R_Oxy_micromol.Kg + R_TEMP * Salinity1, data = dic_train)
+
+# Predict
+lm_predictions_3 <- predict(object = lm_3,
+                          newdata = dic_test)
+dic_test_lm_3 <- cbind(dic_test, lm_predictions_3) # bind to data
+
+# Find RMSE
+sqrt(mean(lm_3$residuals^2))
+rmse(dic_test_lm_3$DIC, dic_test_lm_3$lm_predictions_3)
+```
+
+```{r}
+lm_eval_3 <- predict(object = lm_3,
+                   newdata = dic_eval)
+dic_eval_lm_3 <- cbind(dic_eval, lm_eval_3)
+dic_sub_lm_3 <- dic_eval_lm_3 %>% 
+  select(id, lm_eval_3) %>% 
+  rename(DIC = lm_eval_3)
+
+write_csv(dic_sub_lm_3, "jel_lm3.csv")
+```
+
+```{r}
+lm_4 <- lm(DIC ~ Lat_Dec + Lon_Dec + NO2uM + NO3uM + NH3uM + R_TEMP + R_Depth + R_DYNHT + R_Nuts + R_Oxy_micromol.Kg + PO4uM + SiO3uM + TA1 + Salinity1 +  NO3uM * R_Depth + NO2uM * R_Depth + NH3uM * R_Depth + R_Nuts * R_Depth + SiO3uM * R_Depth + NO3uM * R_Oxy_micromol.Kg + NO2uM * R_Oxy_micromol.Kg + NH3uM * R_Oxy_micromol.Kg + R_Nuts * R_Oxy_micromol.Kg + SiO3uM * R_Oxy_micromol.Kg + TA1 * Salinity1 + TA1 * R_Nuts + R_TEMP * Salinity1, data = dic_train)
+
+# Predict
+lm_predictions_4 <- predict(object = lm_4,
+                          newdata = dic_test)
+dic_test_lm_4 <- cbind(dic_test, lm_predictions_4) # bind to data
+
+# Find RMSE
+sqrt(mean(lm_4$residuals^2))
+rmse(dic_test_lm_4$DIC, dic_test_lm_4$lm_predictions_4)
+```
+
+```{r}
+lm_eval_4 <- predict(object = lm_4,
+                   newdata = dic_eval)
+dic_eval_lm_4 <- cbind(dic_eval, lm_eval_4)
+dic_sub_lm_4 <- dic_eval_lm_4 %>% 
+  select(id, lm_eval_4) %>% 
+  rename(DIC = lm_eval_4)
+
+write_csv(dic_sub_lm_4, "jel_lm4.csv")
+```
+

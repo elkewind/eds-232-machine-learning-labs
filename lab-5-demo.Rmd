@@ -1,0 +1,192 @@
+---
+title: "Lab 5 Demo"
+author: "Elke Windschitll"
+date: "2023-02-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)    
+library(ggplot2)   
+library(rsample)   
+library(recipes)
+library(skimr)
+library(tidymodels)
+library(kknn)
+```
+
+###k-nearest neighbor in tidymodels
+
+## Data
+
+```{r data}
+data(attrition)
+churn <- attrition %>% mutate_if(is.ordered, .funs = factor, ordered = F) 
+#skim(churn_dat)
+```
+
+Not doing the data exploration here in the interest of time and since we are familiar with this dataset.
+
+```{r initial_split}
+set.seed(123)
+#initial split of data, default 75/25
+churn_split <- initial_split(churn)
+churn_test <- testing(churn_split)
+churn_train <- training(churn_split)
+```
+
+We need to create a recipe and do the preprocessing by converting dummy coding the nominal variables and normalizing the numeric variables.
+
+```{r recipe}
+#preprocessing
+knn_rec <- recipe(Attrition ~ ., data = churn_train) %>% 
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) %>% 
+  step_normalize(all_numeric(), -all_outcomes()) %>% 
+  prep()
+
+#bake 
+baked_churn <- bake(knn_rec, churn_train)
+```
+
+Recall: if you want to explore the what the recipe is doing to your data, you can first prep() the recipe to estimate the parameters needed for each step and then bake(new_data = NULL) to pull out the training data with those steps applied.
+
+Now the recipe is ready to be applied to the test data.
+
+```{r bake_test}
+baked_test <- bake(knn_rec, churn_test)
+```
+
+##Specify the k-nearest neighbor model
+
+```{r knn_spec}
+knn_spec <- nearest_neighbor() %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification")
+```
+
+```{r}
+knn_fit <- knn_spec %>% 
+  fit(Attrition ~. , data = churn_train)
+# This is a fine model but not great
+```
+
+
+```{r cv}
+set.seed(123)
+# 10-fold CV on the training dataset
+cv_folds <-churn_train %>% 
+  vfold_cv(v=5) #10 is default
+
+```
+
+We now have a recipe for processing the data, a model specification, and CV splits for the training data.
+
+Let's put it all together in a workflow.
+
+```{r}
+knn_workflow <- workflow() %>% 
+  add_model(knn_spec) %>% 
+  add_recipe(knn_rec)
+```
+
+Now fit the resamples.
+```{r}
+knn_res <- knn_workflow %>% 
+  fit_resamples(
+    resamples = cv_folds,
+    control = control_resamples(save_pred = TRUE)
+  )
+```
+
+# Check the performance
+
+```{r}
+knn_res %>% collect_metrics() # Still using default for k parameter
+```
+
+```{r spec_with_tuning}
+# Define our KNN model with tuning
+knn_spec_tune <- nearest_neighbor(neighbors = tune()) %>% # tune k
+  set_mode("classification") %>% 
+  set_engine("kknn")
+
+# Check the model
+knn_spec_tune
+```
+
+
+```{r}
+# Define a new workflow
+wf_knn_tune <- workflow() %>% 
+  add_model(knn_spec_tune) %>% 
+  add_recipe(knn_rec)
+    
+# Fit the workflow on our predefined folds and hyperparameters
+fit_knn_cv <- wf_knn_tune %>% 
+  tune_grid( 
+    cv_folds, # does tuning based on folds
+    grid = data.frame(neighbors = c(1,5,seq(10,100,10))) # K=1, K=5, K=10, K=20..., K=100. For each different value for k parameter, model will try it on all folds
+  ) # runs 60 different models (5 folds, 12 values of k)
+    
+# Check the performance with collect_metrics()
+fit_knn_cv %>% collect_metrics()
+```
+
+This time before we fit the model we need to tell R which values to try for the parameter that we're tuning.
+
+To tune our hyperparameter(s), we will use the tune_grid() function (instead of the fit() or fit_resamples() functions).
+
+This tune_grid() is similar to fit_resamples() except that it takes an additional argument: grid. We will pass the possible values of our hyperparameter(s) to this grid argument, and it will evaluate each fold of our sample on each set of hyperparameters passed to grid.
+
+```{r evaluate_model}
+knn_fit 
+```
+
+```{r}
+# Define the workflow and fit the model on our predefined folds
+fit_churn_cv 
+# Check the performance
+fit_churn_cv %>% collect_metrics()
+```
+
+And finally, we will predict.
+
+The finalize_workflow() function wants (1) your initial workflow and (2) your best model.
+
+```{r}
+# The final workflow for our KNN model
+final_wf <-
+  knn_workflow %>% 
+  finalize_workflow(select_best(fit_knn_cv))
+
+# Check out the final workflow object
+final_wf
+```
+
+```{r}
+# Fitting our final workflow
+final_fit <- final_wf %>% 
+  fit(data = churn_train)
+# Examine the final workflow
+final_fit
+```
+
+And finally, we can predict onto the testing dataset.
+
+```{r}
+churn_pred <- final_fit %>% predict(new_data = churn_test)
+
+churn_pred %>% head()
+```
+
+There's a better way! You can pass your final workflow (workflow plus the best model) to the last_fit() function along with your initial split (for us: churn_split) to both (a) fit your final model on your full training dataset and (b) make predictions onto the testing dataset (defined in your initial split object).
+
+This last_fit() approach streamlines your work (combining steps) and also lets you easily collect metrics using the collect_metrics() function
+
+```{r}
+# Write over 'final_fit' with this last_fit() approach
+final_fit <- final_wf %>% last_fit(churn_split)
+# Collect metrics on the test data!
+final_fit %>% collect_metrics()
+```
