@@ -1,3 +1,3 @@
 # EDS 232 Machine Learning Lab Documents
 
-This is a small repository containting lab assignments for eds 232 Machine Learning at the Bren School of Environmental Science & Management.
+This is a small repository containting lab assignments for EDS 232 Machine Learning at the Bren School of Environmental Science & Management taught by Mateo Robbins.
