@@ -1,6 +1,6 @@
 ---
 title: "lab7"
-author: "Lewis White"
+author: "Lewis White, Elke Windschitl, Jessica French"
 date: "2023-03-16"
 output: html_document
 ---
